@@ -54,6 +54,15 @@ EXTRA_CFLAGS += -I$(srcdir)/../libqdma/qdma_access/eqdma_cpm5_access
 EXTRA_CFLAGS += -I$(srcdir)/../libqdma/qdma_access/qdma_cpm4_access
 EXTRA_CFLAGS += -I.
 
+# Path to NVIDIA driver source on your system
+NV_SRC_DIR := /usr/src/nvidia-535.129.03
+
+# Include the NVIDIA header directory
+ccflags-y += -I$(NV_SRC_DIR)/nvidia
+
+# Point to the symbol version file to avoid "undefined symbol" warnings
+KBUILD_EXTRA_SYMBOLS += $(NV_SRC_DIR)/Module.symvers
+
 # linux >= 3.13 genl_ops become part of the genl_family. And although
 # genl_register_family_with_ops() is still retained until kernel 4.10,
 # its prototype changed from a extern function to a define.

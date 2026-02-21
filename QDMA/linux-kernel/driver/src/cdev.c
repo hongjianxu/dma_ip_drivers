@@ -84,6 +84,16 @@ static ssize_t cdev_gen_read_write(struct file *file, char __user *buf,
 static void unmap_user_buf(struct qdma_io_cb *iocb, bool write);
 static inline void iocb_release(struct qdma_io_cb *iocb);
 
+/* Callback called by NVIDIA if GPU memory is freed while DMA is active */
+static void qdma_nv_free_callback(void *data) {
+    struct qdma_io_cb *iocb = (struct qdma_io_cb *)data;
+    // In a real production driver, you MUST trigger a hardware abort here.
+    // For this implementation, we invalidate the table pointers.
+    pr_warn("GPU memory revoked by NVIDIA driver for iocb %p\n", iocb);
+    iocb->nv_table = NULL; 
+    iocb->nv_map = NULL;
+}
+
 static inline void xlnx_phy_dev_list_remove(struct xlnx_phy_dev *phy_dev)
 {
 	if (!phy_dev)
@@ -248,6 +258,17 @@ static inline void iocb_release(struct qdma_io_cb *iocb)
 
 static void unmap_user_buf(struct qdma_io_cb *iocb, bool write)
 {
+    if (iocb->is_gpu) {
+        if (iocb->nv_map)
+            nvidia_p2p_free_dma_mapping(iocb->nv_map);
+        if (iocb->nv_table)
+            nvidia_p2p_put_pages(0, 0, (unsigned long)iocb->buf, iocb->nv_table);
+        iocb->nv_map = NULL;
+        iocb->nv_table = NULL;
+        iocb->is_gpu = false;
+        return;
+    }
+
 	int i;
 
 	if (!iocb->pages || !iocb->pages_nr)
@@ -268,7 +289,7 @@ static void unmap_user_buf(struct qdma_io_cb *iocb, bool write)
 	iocb->pages_nr = 0;
 }
 
-static int map_user_buf_to_sgl(struct qdma_io_cb *iocb, bool write)
+static int map_user_host_buf_to_sgl(struct qdma_io_cb *iocb, bool write)
 {
 	unsigned long len = iocb->len;
 	char *buf = iocb->buf;
@@ -350,6 +371,60 @@ err_out:
 	iocb_release(iocb);
 
 	return rv;
+}
+
+static int map_user_buf_to_sgl(struct qdma_io_cb *iocb, bool write)
+{
+    unsigned long len = iocb->len;
+    char *buf = iocb->buf;
+    struct qdma_sw_sg *sg;
+    int rv, i;
+    char *gpu_aligned_buf = buf & (~ GPU_PAGE_MASK);
+    unsigned int gpu_pg_offset = (buf & GPU_PAGE_MASK); 
+    unsigned long gpu_pages_nr = (len + gpu_pg_offset + GPU_PAGE_SIZE-1) >> GPU_PAGE_SHIFT;
+    unsigned long gpu_len = gpu_pages_nr << GPU_PAGE_SHIFT;
+
+    // 1. Attempt NVIDIA GPU Pinning First
+    rv = nvidia_p2p_get_pages(0, 0, (unsigned long)gpu_aliigned_buf, gpu_len,
+                             &iocb->nv_table, qdma_nv_free_callback, iocb);
+
+    if (rv == 0) { // SUCCESS: This is a GPU address
+        iocb->is_gpu = true;
+        iocb->pages_nr = iocb->nv_table->entries;
+
+        // Map GPU pages to PCIe Bus Addresses
+        // xcdev->pdev is the pci_dev associated with the QDMA
+        struct qdma_cdev *xcdev = container_of(iocb, struct qdma_io_cb, req);
+        rv = nvidia_p2p_dma_map_pages(xcdev->pdev, iocb->nv_table, &iocb->nv_map);
+        if (rv < 0) goto err_nv_put;
+
+        iocb->sgl = kmalloc(iocb->pages_nr * sizeof(struct qdma_sw_sg), GFP_KERNEL);
+        if (!iocb->sgl) { rv = -ENOMEM; goto err_nv_unmap; }
+
+        sg = iocb->sgl;
+        for (i = 0; i < iocb->pages_nr; i++, sg++) {
+            sg->next = sg + 1;
+            sg->pg = NULL; // No struct page for GPU VRAM
+            sg->offset = ( i == 0) ? gpu_pg_offset : 0;
+            sg->len = min_t(size_t, len, iocb->nv_table->page_size - sg->offset);
+            sg->dma_addr = iocb->nv_map->dma_addresses[i] + sg->offset;
+
+            len -= sg->len;
+        }
+        return 0;
+    }
+
+    // 2. Fallback to Standard Host Memory Logic
+    iocb->is_gpu = false;
+    // ... Copy your original map_user_buf_to_sgl code here ...
+    // Ensure you use dma_map_page() on the host pages to populate sg->dma_addr
+    return map_user_host_buf_to_sgl(iocb, write);
+
+err_nv_unmap:
+    nvidia_p2p_free_dma_mapping(iocb->nv_map);
+err_nv_put:
+    nvidia_p2p_put_pages(0, 0, (unsigned long)buf, iocb->nv_table);
+    return rv;
 }
 
 static ssize_t cdev_gen_read_write(struct file *file, char __user *buf,

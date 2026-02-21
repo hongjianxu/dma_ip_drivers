@@ -31,6 +31,12 @@
 #include "libqdma/libqdma_export.h"
 #include <linux/workqueue.h>
 
+/* GPU Driver header */
+#include <nv-p2p.h>
+
+#define GPU_PAGE_SHIFT 16
+#define GPU_PAGE_SIZE (2<<GPU_PAGE_SHIFT)
+#define GPU_PAGE_MASK ((u64)1 << GPU_PAGE_SHIFT)-1)
 /** QDMA character device class name */
 #define QDMA_CDEV_CLASS_NAME  DRV_MODULE_NAME
 /** QDMA character device max minor number to support 4k queues */
@@ -111,6 +117,9 @@ struct qdma_io_cb {
 	struct page **pages;
 	/** qdma request */
 	struct qdma_request req;
+    struct nvidia_p2p_page_table *nv_table;
+    struct nvidia_p2p_dma_mapping *nv_map;
+    bool is_gpu;
 };
 
 /*****************************************************************************/
